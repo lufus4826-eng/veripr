@@ -234,6 +234,10 @@ def _is_bughunt_git_line(line: str) -> bool:
     return ".bughunt" in parts
 
 
+_TRUNK_BRANCH_NAMES = frozenset({"main", "master", "develop", "trunk", "HEAD", ""})
+_TRUNK_CANDIDATES = ("main", "master", "origin/main", "origin/master", "develop", "origin/develop")
+
+
 def _detect_base_head_refs(root: Path, base_arg: Optional[str], head_arg: Optional[str]) -> Tuple[str, str]:
     if not is_git_repo(root):
         return base_arg or "BASE", head_arg or "WORKTREE"
@@ -246,8 +250,27 @@ def _detect_base_head_refs(root: Path, base_arg: Optional[str], head_arg: Option
     if st_proc.returncode == 0:
         dirty = any(not _is_bughunt_git_line(ln) for ln in st_proc.stdout.splitlines() if ln.strip())
 
+    resolved_head = head_arg or ("WORKTREE" if dirty else "HEAD")
     if base_arg:
-        return base_arg, (head_arg or ("WORKTREE" if dirty else "HEAD"))
+        return base_arg, resolved_head
+
+    # On a multi-commit feature branch, compare against merge-base with trunk instead of only HEAD~1
+    if has_head:
+        br_proc = _run_git(root, ["symbolic-ref", "--short", "-q", "HEAD"], timeout_s=10)
+        curr_branch = br_proc.stdout.strip() if br_proc.returncode == 0 else ""
+        head_sha_proc = _run_git(root, ["rev-parse", "HEAD"], timeout_s=10)
+        head_sha = head_sha_proc.stdout.strip() if head_sha_proc.returncode == 0 else ""
+        if curr_branch and curr_branch not in _TRUNK_BRANCH_NAMES and head_sha:
+            for trunk in _TRUNK_CANDIDATES:
+                if _run_git(root, ["rev-parse", "--verify", trunk], timeout_s=10).returncode != 0:
+                    continue
+                mb_proc = _run_git(root, ["merge-base", trunk, "HEAD"], timeout_s=10)
+                mb_sha = mb_proc.stdout.strip() if mb_proc.returncode == 0 else ""
+                if mb_sha and mb_sha != head_sha:
+                    trunk_sha = _run_git(root, ["rev-parse", trunk], timeout_s=10).stdout.strip()
+                    base_label = trunk if mb_sha == trunk_sha else mb_sha[:12]
+                    return base_label, resolved_head
+                break
 
     if dirty and has_head:
         return "HEAD", (head_arg or "WORKTREE")
@@ -259,6 +282,62 @@ def _detect_base_head_refs(root: Path, base_arg: Optional[str], head_arg: Option
         return "HEAD", (head_arg or "WORKTREE")
 
     return "HEAD", (head_arg or "WORKTREE")
+
+
+def _list_untracked_non_ignored_files(root: Path) -> List[str]:
+    if not is_git_repo(root):
+        return []
+    proc = _run_git(root, ["ls-files", "--others", "--exclude-standard"], timeout_s=15)
+    if proc.returncode != 0:
+        return []
+    out: List[str] = []
+    for raw in proc.stdout.splitlines():
+        rel = raw.strip().strip('"').replace("\\", "/")
+        if rel and not rel.startswith(".bughunt/") and "/.bughunt/" not in rel:
+            out.append(rel)
+    return sorted(set(out))
+
+
+def _list_gitignored_relpaths(root: Path) -> Set[str]:
+    if not is_git_repo(root):
+        return set()
+    proc = _run_git(root, ["status", "--porcelain", "--ignored", "--", "."], timeout_s=20)
+    if proc.returncode != 0:
+        return set()
+    ignored: Set[str] = set()
+    for ln in proc.stdout.splitlines():
+        if ln.startswith("!! "):
+            p = ln[3:].strip().strip('"').replace("\\", "/").rstrip("/")
+            if p and not p.startswith(".bughunt"):
+                ignored.add(p)
+    return ignored
+
+
+def _write_lf_file(path: Path, text: str) -> None:
+    """Write UTF-8 text with guaranteed pure LF (\\n) line endings across Windows/POSIX."""
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(normalized.encode("utf-8"))
+
+
+def _verify_patch_applies(base_dir: Path, patch_path: Path) -> Tuple[bool, str]:
+    """Verify exported patch cleanly applies with whitespace tolerance."""
+    if not patch_path.is_file() or not patch_path.read_text(encoding="utf-8", errors="replace").strip():
+        return True, "empty"
+    if not shutil.which("git"):
+        return True, "git_unavailable"
+    proc = subprocess.run(
+        ["git", "apply", "--check", "--ignore-space-change", "--ignore-whitespace", str(patch_path.resolve())],
+        cwd=str(base_dir),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=20,
+    )
+    if proc.returncode == 0:
+        return True, "OK"
+    return False, trunc(proc.stderr or proc.stdout or "git apply --check failed", 120)
 
 
 def take_snapshot(root: Path, forced_mode: Optional[str] = None) -> Tuple[str, List[str]]:
@@ -961,14 +1040,11 @@ def cmd_diff_scope(args: argparse.Namespace) -> int:
                     if not rel_f.startswith(".bughunt/") and "/.bughunt/" not in rel_f:
                         changed_files.append((st_code, rel_f))
 
-        if head_ref == "WORKTREE":
-            ut_proc = _run_git(root, ["ls-files", "--others", "--exclude-standard"], timeout_s=15)
-            if ut_proc.returncode == 0:
-                existing = {f for _, f in changed_files}
-                for ln in ut_proc.stdout.splitlines():
-                    rel_f = ln.strip().replace("\\", "/")
-                    if rel_f and not rel_f.startswith(".bughunt/") and rel_f not in existing:
-                        changed_files.append(("A", rel_f))
+        if head_ref in ("WORKTREE", "HEAD"):
+            existing = {f for _, f in changed_files}
+            for rel_f in _list_untracked_non_ignored_files(root):
+                if rel_f not in existing:
+                    changed_files.append(("A", rel_f))
 
         ud_proc = _run_git(root, udiff_args, timeout_s=20)
         if ud_proc.returncode == 0:
@@ -1387,6 +1463,65 @@ def cmd_impact_map(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 
+def _merge_elem_list(elems: List[Any]) -> List[Any]:
+    dict_elems = [e for e in elems if isinstance(e, dict)]
+    other_elems = [e for e in elems if not isinstance(e, dict)]
+    merged_list: List[Any] = []
+    if dict_elems:
+        acc = dict_elems[0]
+        for nxt in dict_elems[1:]:
+            acc = merge_schema_signatures(acc, nxt)
+        merged_list.append(acc)
+    seen: Dict[str, Any] = {}
+    for item in other_elems:
+        key = json.dumps(item, sort_keys=True, separators=(",", ":"))
+        seen[key] = item
+    for k in sorted(seen):
+        merged_list.append(seen[k])
+    return merged_list
+
+
+def merge_schema_signatures(sig_a: Any, sig_b: Any) -> Any:
+    """Merge two schema signatures (e.g. empty list + populated list, or nullable + concrete type)."""
+    if sig_a == sig_b:
+        return sig_a
+    if sig_a == "null" and sig_b is not None:
+        return sig_b
+    if sig_b == "null" and sig_a is not None:
+        return sig_a
+    if sig_a == ["empty"] and isinstance(sig_b, list) and len(sig_b) == 2 and sig_b[0] == "array":
+        return sig_b
+    if sig_b == ["empty"] and isinstance(sig_a, list) and len(sig_a) == 2 and sig_a[0] == "array":
+        return sig_a
+    if isinstance(sig_a, dict) and isinstance(sig_b, dict):
+        merged: Dict[str, Any] = {}
+        for k in sorted(set(sig_a) | set(sig_b)):
+            if k in sig_a and k in sig_b:
+                merged[k] = merge_schema_signatures(sig_a[k], sig_b[k])
+            elif k in sig_a:
+                merged[k] = sig_a[k]
+            else:
+                merged[k] = sig_b[k]
+        return merged
+    if (
+        isinstance(sig_a, list) and len(sig_a) == 2 and sig_a[0] == "array"
+        and isinstance(sig_b, list) and len(sig_b) == 2 and sig_b[0] == "array"
+    ):
+        return ["array", _merge_elem_list(list(sig_a[1]) + list(sig_b[1]))]
+    if isinstance(sig_a, list) and len(sig_a) == 2 and sig_a[0] == "union":
+        parts = list(sig_a[1])
+    else:
+        parts = [sig_a]
+    if isinstance(sig_b, list) and len(sig_b) == 2 and sig_b[0] == "union":
+        parts.extend(sig_b[1])
+    else:
+        parts.append(sig_b)
+    uniq = {json.dumps(p, sort_keys=True, separators=(",", ":")): p for p in parts}
+    if len(uniq) == 1:
+        return next(iter(uniq.values()))
+    return ["union", [uniq[k] for k in sorted(uniq)]]
+
+
 def compute_schema_signature(obj: Any) -> Any:
     """Compute canonical structure/type tree while ignoring dynamic values of same type."""
     if obj is None:
@@ -1403,11 +1538,7 @@ def compute_schema_signature(obj: Any) -> Any:
         if not obj:
             return ["empty"]
         elem_sigs = [compute_schema_signature(item) for item in obj]
-        unique_sorted = sorted(
-            {json.dumps(s, sort_keys=True, separators=(",", ":")): s for s in elem_sigs}.items(),
-            key=lambda kv: kv[0],
-        )
-        return ["array", [v for _, v in unique_sorted]]
+        return ["array", _merge_elem_list(elem_sigs)]
     return type(obj).__name__
 
 
@@ -1491,21 +1622,38 @@ def _compute_sandbox_exclusions(root: Path, extra: Sequence[str]) -> Tuple[set[s
     return global_excl, root_excl
 
 
-def _copy_project_tree(root: Path, dest: Path, global_excl: set[str], root_excl: set[str]) -> int:
+def _copy_project_tree(
+    root: Path,
+    dest: Path,
+    global_excl: set[str],
+    root_excl: set[str],
+    ignored_rels: Optional[Set[str]] = None,
+) -> int:
     dest.mkdir(parents=True, exist_ok=True)
     copied = 0
     root_res = root.resolve()
+    ign = ignored_rels or set()
     for dirpath, dirnames, filenames in os.walk(root_res):
         dp = Path(dirpath)
         rel_dir = dp.relative_to(root_res)
         at_root = rel_dir == Path(".")
-        dirnames[:] = sorted(
-            d for d in dirnames
-            if d not in global_excl and not (at_root and d in root_excl) and not ((dp / d).is_symlink() and not (dp / d).exists())
-        )
+        kept_dirs: List[str] = []
+        for d in sorted(dirnames):
+            if d in global_excl or (at_root and d in root_excl):
+                continue
+            if (dp / d).is_symlink() and not (dp / d).exists():
+                continue
+            rel_d = d if at_root else f"{rel_dir.as_posix()}/{d}"
+            if rel_d in ign:
+                continue
+            kept_dirs.append(d)
+        dirnames[:] = kept_dirs
         out_dir = dest if at_root else (dest / rel_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
         for fname in sorted(filenames):
+            rel_f = fname if at_root else f"{rel_dir.as_posix()}/{fname}"
+            if rel_f in ign:
+                continue
             src_f = dp / fname
             dst_f = out_dir / fname
             try:
@@ -1518,17 +1666,40 @@ def _copy_project_tree(root: Path, dest: Path, global_excl: set[str], root_excl:
     return copied
 
 
-def _create_git_worktree_or_copy(root: Path, ref: str, dest: Path) -> str:
+def _copy_untracked_into_dest(root: Path, dest: Path) -> int:
+    copied = 0
+    for rel_f in _list_untracked_non_ignored_files(root):
+        src_f = root / rel_f
+        if not src_f.is_file():
+            continue
+        dst_f = dest / rel_f
+        dst_f.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src_f, dst_f, follow_symlinks=True)
+        copied += 1
+    return copied
+
+
+def _create_git_worktree_or_copy(
+    root: Path,
+    ref: str,
+    dest: Path,
+    include_untracked: bool = False,
+) -> str:
     if dest.exists():
         _remove_worktree_dir(root, dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
     if ref == "WORKTREE" or not is_git_repo(root):
         global_excl, root_excl = _compute_sandbox_exclusions(root, [])
-        _copy_project_tree(root, dest, global_excl, root_excl)
+        ignored = _list_gitignored_relpaths(root) if is_git_repo(root) else set()
+        _copy_project_tree(root, dest, global_excl, root_excl, ignored_rels=ignored)
+        if include_untracked and is_git_repo(root):
+            _copy_untracked_into_dest(root, dest)
         return "copy"
 
     proc = _run_git(root, ["worktree", "add", "--detach", "--force", str(dest), ref], timeout_s=45)
     if proc.returncode == 0:
+        if include_untracked:
+            _copy_untracked_into_dest(root, dest)
         return "git_worktree"
 
     # Fallback: materialize tree via git archive / ls-tree
@@ -1548,6 +1719,8 @@ def _create_git_worktree_or_copy(root: Path, ref: str, dest: Path) -> str:
             )
             if b_proc.returncode == 0:
                 out_f.write_bytes(b_proc.stdout)
+        if include_untracked:
+            _copy_untracked_into_dest(root, dest)
         return "git_show_fallback"
 
     raise SystemExit(f"[vpr.py] ERROR: Unable to materialize worktree for ref {ref!r}: {proc.stderr.strip()}")
@@ -1565,9 +1738,9 @@ def _ensure_worktrees(root: Path, s_dir: Path, base_ref: str, head_ref: str, for
     wt_base = s_dir / "tmp" / "worktree-base"
     wt_head = s_dir / "tmp" / "worktree-head"
     if force or not wt_base.is_dir():
-        _create_git_worktree_or_copy(root, base_ref, wt_base)
+        _create_git_worktree_or_copy(root, base_ref, wt_base, include_untracked=False)
     if force or not wt_head.is_dir():
-        _create_git_worktree_or_copy(root, head_ref, wt_head)
+        _create_git_worktree_or_copy(root, head_ref, wt_head, include_untracked=True)
     return wt_base, wt_head
 
 
@@ -1760,17 +1933,36 @@ def _parse_run_output(raw: str, exit_code: int, duration_s: float, cmd: List[str
         if re.search(pat, raw):
             ev.harness_signals.append(lbl)
 
-    # Extract VERIPR_PAYLOAD:{...} & VERIPR_CHECK:{...}
+    # Extract VERIPR_PAYLOAD:{...} & VERIPR_CHECK:{...} (merging multi-sample payloads)
     payloads: Dict[str, Any] = {}
     p_idx = 0
+
+    def _record_payload(key: str, raw_obj: Dict[str, Any]) -> None:
+        sigs: List[Any] = []
+        if isinstance(raw_obj.get("samples"), list) and raw_obj["samples"]:
+            sigs = [compute_schema_signature(smp) for smp in raw_obj["samples"]]
+        elif "payload" in raw_obj:
+            sigs = [compute_schema_signature(raw_obj["payload"])]
+        else:
+            sigs = [compute_schema_signature(raw_obj)]
+        combined = sigs[0]
+        for nxt in sigs[1:]:
+            combined = merge_schema_signatures(combined, nxt)
+        if key in payloads:
+            payloads[key] = merge_schema_signatures(payloads[key], combined)
+        else:
+            payloads[key] = combined
+
     for ln in raw.splitlines():
         s = ln.strip()
         if s.startswith(PAYLOAD_PREFIX):
             try:
                 obj = json.loads(s[len(PAYLOAD_PREFIX) :].strip())
-                if isinstance(obj, dict) and "payload" in obj and ("id" in obj or "endpoint" in obj):
-                    key = str(obj.get("endpoint") or obj.get("id"))
-                    payloads[key] = compute_schema_signature(obj["payload"])
+                if isinstance(obj, dict) and ("payload" in obj or "samples" in obj):
+                    key = str(obj.get("endpoint") or obj.get("id") or f"payload_{p_idx}")
+                    if "endpoint" not in obj and "id" not in obj:
+                        p_idx += 1
+                    _record_payload(key, obj)
                 else:
                     payloads[f"payload_{p_idx}"] = compute_schema_signature(obj)
                     p_idx += 1
@@ -1781,10 +1973,11 @@ def _parse_run_output(raw: str, exit_code: int, duration_s: float, cmd: List[str
                 chk = json.loads(s[len(CHECK_PREFIX) :].strip())
                 if isinstance(chk, dict):
                     ev.veripr_checks.append(chk)
-                    if "payload" in chk:
+                    if "payload" in chk or "samples" in chk:
                         key = str(chk.get("endpoint") or chk.get("id") or f"check_{p_idx}")
-                        payloads[key] = compute_schema_signature(chk["payload"])
-                        p_idx += 1
+                        if "endpoint" not in chk and "id" not in chk:
+                            p_idx += 1
+                        _record_payload(key, chk)
             except json.JSONDecodeError:
                 ev.harness_signals.append("invalid VERIPR_CHECK JSON")
 
@@ -2198,22 +2391,25 @@ def cmd_verify_fix(args: argparse.Namespace) -> int:
     combined_patch_rel = ""
     changed_files: List[str] = []
 
+    patch_check_note = ""
     if verdict == "CONFIRMED_ZERO_RIPPLE_FIX":
-        # Export per-ID incremental patch (relative to saved checkpoint for tid or _last_accepted/wt_head)
+        # Export per-ID incremental patch with guaranteed pure LF (\n) endings
         id_ckpt = _checkpoint_dir(s_dir, tid)
         last_ckpt = _checkpoint_dir(s_dir, "_last_accepted")
         incr_base = id_ckpt if id_ckpt.is_dir() else (last_ckpt if last_ckpt.is_dir() else wt_head)
         changed_files, id_patch = _compute_unified_diff(incr_base, fix_dir, root)
         patch_path = s_dir / "patches" / f"{tid}.patch"
-        patch_path.write_text(id_patch, encoding="utf-8")
+        _write_lf_file(patch_path, id_patch)
         patch_rel = rel_posix(patch_path, root)
 
         # Save _last_accepted checkpoint & cumulative patch relative to worktree-head
         _save_sandbox_checkpoint(root, s_dir, "_last_accepted")
         _, comb_patch = _compute_unified_diff(wt_head, fix_dir, root)
         comb_path = s_dir / "patches" / "veripr-fixes.patch"
-        comb_path.write_text(comb_patch, encoding="utf-8")
+        _write_lf_file(comb_path, comb_patch)
         combined_patch_rel = rel_posix(comb_path, root)
+        chk_ok, chk_msg = _verify_patch_applies(wt_head, comb_path)
+        patch_check_note = f"git_apply={chk_msg}" if chk_ok else f"git_apply_warn={chk_msg}"
     elif args.auto_rollback:
         id_ckpt = _checkpoint_dir(s_dir, tid)
         last_ckpt = _checkpoint_dir(s_dir, "_last_accepted")
@@ -2243,6 +2439,7 @@ def cmd_verify_fix(args: argparse.Namespace) -> int:
         "changed_files": changed_files,
         "patch_file": patch_rel,
         "combined_patch": combined_patch_rel,
+        "patch_check": patch_check_note,
     }
     (s_dir / "logs" / f"{tid}_fix.json").write_text(json.dumps(fix_record, indent=2) + "\n", encoding="utf-8")
 
@@ -2262,7 +2459,9 @@ def cmd_verify_fix(args: argparse.Namespace) -> int:
         f"Suite={suite_note} | FeaturePreserved={feature_note}",
     ]
     if patch_rel:
-        out_lines.append(f"PatchExport: {patch_rel} (combined: {combined_patch_rel}; files={changed_files})")
+        out_lines.append(
+            f"PatchExport: {patch_rel} (combined: {combined_patch_rel}; {patch_check_note}; files={changed_files})"
+        )
     else:
         out_lines.append(f"Reason: {trunc(reason, 130)}")
     print("\n".join(out_lines[:10]))
@@ -2333,9 +2532,9 @@ def cmd_sandbox(args: argparse.Namespace) -> int:
         base_dir = wt_head if wt_head.is_dir() else root
         changed_files, full_patch = _compute_unified_diff(base_dir, fix_dir, root)
         patch_path = s_dir / "patches" / "veripr-fixes.patch"
-        patch_path.write_text(full_patch, encoding="utf-8")
+        _write_lf_file(patch_path, full_patch)
         diff_log = s_dir / "logs" / "sandbox-fix.diff"
-        diff_log.write_text(full_patch, encoding="utf-8")
+        _write_lf_file(diff_log, full_patch)
 
         header = f"[vpr sandbox diff] files_changed={len(changed_files)} saved={rel_posix(patch_path, root)}"
         if not changed_files:

@@ -1,7 +1,7 @@
 # VeriPR Pre-Commit & PR Differential Impact Report (Sample)
 
 ## Session Metadata
-- **Session ID (`S`):** `.bughunt/pr-20261118-103258/`
+- **Session ID (`S`):** `.bughunt/pr-20261118-104328/`
 - **Compared Refs:** `Base: HEAD` vs. `Head: WORKTREE`
 - **Dual-Gate Protocol:** Gate 1 Differential Worktree Check (`ab-verify`) | Gate 2 Zero-Ripple Fix + Feature Preservation (`verify-fix`)
 - **PR Verdict:** `BLOCKED_PENDING_FIX_APPLICATION` (2 ripple/contract fixes exported cleanly)

@@ -2,7 +2,7 @@
 
 [![Agent Skills Standard](https://img.shields.io/badge/Agent%20Skills-Compliant-blue.svg)](https://agentskills.io)
 [![CI](https://github.com/lufus4826-eng/veripr/actions/workflows/ci.yml/badge.svg)](https://github.com/lufus4826-eng/veripr/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/Version-1.0.0-purple.svg)](https://github.com/lufus4826-eng/veripr/releases/tag/v1.0.0)
+[![Version](https://img.shields.io/badge/Version-1.1.0-purple.svg)](https://github.com/lufus4826-eng/veripr/releases/tag/v1.1.0)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Platforms](https://img.shields.io/badge/Platforms-Claude%20Code%20%7C%20Antigravity%20%7C%20Cursor%20%7C%20Windsurf-green.svg)](#installation)
 [![OS](https://img.shields.io/badge/OS-Windows%20%7C%20macOS%20%7C%20Linux-orange.svg)](#supported-stacks--language-adapters)
@@ -22,15 +22,16 @@ When reviewing changes right before `git commit` or opening a Pull Request, four
 3. **False Blame from Pre-Existing Main-Branch Debt:** Running the full suite reports an unrelated legacy test failure, wasting developer time or unfairly blocking a clean PR.
 4. **Naive Fixes Wiping Out New PR Features:** Asking an AI or rushed developer to "fix the failing caller" often results in reverting the edited function back to `Base`, silently deleting the new feature introduced in the PR.
 
-**VeriPR (`v1.0.0`) eliminates all four using a zero-dependency Python CLI engine (`scripts/vpr.py`) and strict 2-Layer Dual-Gate verification:**
+**VeriPR (`v1.1.0`) eliminates all four using a zero-dependency Python CLI engine (`scripts/vpr.py`) and strict 2-Layer Dual-Gate verification:**
 - **Gate 1 — Differential Gate (`ab-verify` on Parallel Git Worktrees `Base` vs. `Head`):**
+  - **Multi-Commit Branch & Untracked Helper Awareness:** Automatically detects `git merge-base <trunk> HEAD` on multi-commit feature branches (so bugs introduced in early branch commits never slip past) and preserves newly created untracked non-ignored helper modules inside `worktree-head` and `S/sandbox-fix/` (while filtering `.gitignore` build artifacts).
   - **Identical Twin Execution (`VERIPR_TARGET_ROOT`):** Runs every 1-hop caller test, regression check, and `VERIPR_PAYLOAD:` probe against isolated snapshots of **Base** (`S/tmp/worktree-base`) and **Head** (`S/tmp/worktree-head`).
-  - **Recursive API Structure Hashing (`schema_hash`):** Converts nested JSON/dict responses into canonical structure-and-type signatures (ignoring dynamic primitive values of the same type) to flag dropped keys, renamed keys, and breaking type changes (`GATE1_CONTRACT_DRIFT`) while tolerating harmless additive keys.
+  - **Multi-Sample Recursive API Structure Hashing (`schema_hash`):** Converts nested JSON/dict responses into canonical structure-and-type signatures and merges multiple samples per endpoint (`merge_schema_signatures`) — resolving `[]` + populated arrays and nullable optional fields so empty-list edge samples never hide nested object key renames (`GATE1_CONTRACT_DRIFT`) while tolerating harmless additive keys.
   - **Pre-Existing Debt Filtering (`PRE_EXISTING_FAILURE`):** Failures that reproduce identically on both `Base` and `Head` are marked `blocks_pr=false` and filtered out automatically in Gate 2 — while any brand-new failure introduced on top of legacy debt is caught as `GATE1_NEW_REGRESSION`.
 - **Gate 2 — Zero-Ripple Fix Gate (`verify-fix --auto-rollback` on `S/sandbox-fix/`):**
   - **Full Contract & Caller Verification:** Re-runs the target check, confirms backward-compatible `schema_hash` parity with `Base`, and runs 1-hop callers (`--caller-cmd`) plus the project test suite (`--test-cmd`, automatically filtering verified `PRE_EXISTING_FAILURE` tests).
   - **Mandatory New Feature Preservation (`--feature-cmd`):** Explicitly runs the new PR feature tests. Any naive revert or over-broad edit that breaks the developer's new feature is immediately rejected with **`REJECTED_FEATURE_BROKEN`** and **auto-rolled back byte-for-byte** to the checkpoint.
-  - **Ready-to-Apply Incremental Patches:** On `CONFIRMED_ZERO_RIPPLE_FIX`, exports per-finding patches (`S/patches/<id>.patch`) and a combined cumulative patch (`S/patches/veripr-fixes.patch`) verified clean relative to `Head` for direct `git apply`.
+  - **Pure LF Cross-Platform Incremental Patches:** On `CONFIRMED_ZERO_RIPPLE_FIX`, exports per-finding patches (`S/patches/<id>.patch`) and a cumulative patch (`S/patches/veripr-fixes.patch`) written strictly with pure LF (`\n`) bytes and validated with `git apply --check --ignore-space-change --ignore-whitespace` across Windows, macOS, and Linux.
 
 ---
 
@@ -133,11 +134,11 @@ flowchart TD
 
 | Subcommand | Description |
 |---|---|
-| `init [--root .] [--base REF] [--head REF\|WORKTREE]` | Creates `.bughunt/pr-<YYYYMMDD-HHMMSS>/{tests,logs,tmp,patches}` + `.cache`, auto-detects `Base` vs. `Head` (`HEAD` vs. `WORKTREE` or `HEAD~1` vs. `HEAD`), snapshots `fs-before.txt`, initializes `worklog.md`, and prints 1-line JSON. |
-| `diff-scope [--root .] [--s S]` | Parses Git hunks + Python AST / multi-language brace symbols to detect `RETURN_SHAPE_CHANGED`, `CONTRACT_KEY_RENAMED_OR_DROPPED`, `SIGNATURE_CHANGED`, and `ERROR_GUARD_REMOVED` (`<=25` lines). |
+| `init [--root .] [--base REF] [--head REF\|WORKTREE]` | Creates `.bughunt/pr-<YYYYMMDD-HHMMSS>/{tests,logs,tmp,patches}` + `.cache`, auto-detects `git merge-base` on feature branches (or `HEAD` vs. `WORKTREE` / `HEAD~1` vs. `HEAD`), snapshots `fs-before.txt`, initializes `worklog.md`, and prints 1-line JSON. |
+| `diff-scope [--root .] [--s S]` | Parses Git hunks (including untracked non-ignored modules) + Python AST / multi-language brace symbols to detect `RETURN_SHAPE_CHANGED`, `CONTRACT_KEY_RENAMED_OR_DROPPED`, `SIGNATURE_CHANGED`, and `ERROR_GUARD_REMOVED` (`<=25` lines). |
 | `impact-map [--root .] [--s S] [--max-lines 25]` | Scans repository files (stripping comments and docstrings) for 1-hop callers, tracks return-value usage (`arithmetic_op`, `subscript_access`, `attr(...)`), checks `Tested=YES\|NO`, and caps output at `<=25` lines. |
-| `ab-verify --s S --id ID --category CAT -- <cmd>` | Materializes parallel `worktree-base` & `worktree-head`, executes `<cmd>` with `VERIPR_TARGET_ROOT`, hashes nested API responses (`schema_hash`), and separates PR regressions/drift from `PRE_EXISTING_FAILURE` (`<=10`-line digest). |
-| `verify-fix --s S --id ID [--auto-rollback] [--test-cmd "..."] [--caller-cmd "..."] [--feature-cmd "..."]` | Runs inside `S/sandbox-fix/`: enforces target fix + restored `schema_hash` + 1-hop callers + project suite (`PASS_FILTERED_PREEXISTING` for verified legacy failures) + new PR feature preservation (`REJECTED_FEATURE_BROKEN`), auto-restoring on rejection and exporting `S/patches/<id>.patch` & `S/patches/veripr-fixes.patch`. |
+| `ab-verify --s S --id ID --category CAT -- <cmd>` | Materializes parallel `worktree-base` & `worktree-head` (preserving untracked helper modules), executes `<cmd>` with `VERIPR_TARGET_ROOT`, merges multi-sample API schemas into `schema_hash`, and separates PR regressions/drift from `PRE_EXISTING_FAILURE` (`<=10`-line digest). |
+| `verify-fix --s S --id ID [--auto-rollback] [--test-cmd "..."] [--caller-cmd "..."] [--feature-cmd "..."]` | Runs inside `S/sandbox-fix/`: enforces target fix + restored `schema_hash` + 1-hop callers + project suite (`PASS_FILTERED_PREEXISTING` for verified legacy failures) + new PR feature preservation (`REJECTED_FEATURE_BROKEN`), exports pure LF `.patch` files verified via `git apply --check --ignore-space-change --ignore-whitespace`, and auto-restores on rejection. |
 | `sandbox --s S --mode init-worktrees\|fix\|save\|rollback\|diff\|clean [--id ID]` | Manages parallel worktrees, `S/sandbox-fix/`, checkpoints, compact unified diffs (`<=8,000` chars), and full `git worktree remove/prune` + cleanliness checks. |
 | `log --s S [--status "..."] [--entry "..."]` | Atomically updates `Status:` in `S/worklog.md` and appends timestamped 1-line entries. |
 | `summary --s S [--snippets]` | Emits Markdown Gate 1 / Gate 2 tables, rejected rollback history, exported `.patch` paths, and compact `<=6`-line evidence snippets. |
@@ -175,9 +176,9 @@ veripr/
 ├── CONTRIBUTING.md                   # Contributor & language adapter authoring guide
 ├── LICENSE                           # MIT License
 ├── scripts/
-│   └── vpr.py                        # Zero-dependency stdlib Python CLI engine (v1.0)
+│   └── vpr.py                        # Zero-dependency stdlib Python CLI engine (v1.1)
 ├── tests/
-│   └── test_vpr_cli.py               # 8-suite cross-platform unit & integration tests
+│   └── test_vpr_cli.py               # 12-suite cross-platform unit & integration tests
 ├── examples/
 │   └── checkout_pr_demo/             # 1-command runnable E2E showcase + sample-pr-report.md
 └── resources/

@@ -49,8 +49,8 @@ Goal: Catch **1-hop caller ripple bugs**, **silent API contract drift**, and **n
 
 ## Phase 0–1 — Init, Diff-Scope & 1-Hop Impact Map
 1. **Single Fused Init + Scope + Impact Command:**
-   - `python "<VPR>" init --root .` -> capture `{S, SNAME, CACHE, ROOT, base_ref, head_ref}`
-   - `python "<VPR>" diff-scope --root . --s "$S"` -> detects changed symbols + semantic risks (`RETURN_SHAPE_CHANGED`, `CONTRACT_KEY_RENAMED_OR_DROPPED`, `SIGNATURE_CHANGED`, `ERROR_GUARD_REMOVED`) in `<=25` lines.
+   - `python "<VPR>" init --root .` -> capture `{S, SNAME, CACHE, ROOT, base_ref, head_ref}` (automatically resolves `git merge-base <trunk> HEAD` on multi-commit feature branches, or `HEAD` vs `WORKTREE` when uncommitted changes exist, while preserving untracked helper modules in `worktree-head`).
+   - `python "<VPR>" diff-scope --root . --s "$S"` -> detects changed symbols (including untracked new modules) + semantic risks (`RETURN_SHAPE_CHANGED`, `CONTRACT_KEY_RENAMED_OR_DROPPED`, `SIGNATURE_CHANGED`, `ERROR_GUARD_REMOVED`) in `<=25` lines.
    - `python "<VPR>" impact-map --root . --s "$S" --max-lines 25` -> lists 1-hop callers + test coverage status in `<=25` lines.
    Load `resources/ripple-taxonomy.md`, `resources/lang/00-common.md`, and ONLY matching `resources/lang/<lang>.md`.
 2. **Targeted Inspection:** Use ranged `read_file` (`<=150`L) on changed functions and high-risk/untested 1-hop callers to plan focused checks (`PR-1`, `PR-2`, ...), including any pre-existing failing project test (`PR-3`) so Gate 1 proves whether it is legacy branch debt (`PRE_EXISTING_FAILURE`).
@@ -59,7 +59,7 @@ Goal: Catch **1-hop caller ripple bugs**, **silent API contract drift**, and **n
 1. **Fuse Log + Batch Write Targeted Checks (One Turn):**
    - Fuse `python "<VPR>" log --s "$S" --status "Phase 2 - Differential Gate" --entry "..."` with parallel `write_file` calls writing `S/tests/test_pr1.<ext>`, `S/tests/probe_pr2.<ext>`, ...
    - Every test/probe MUST read `VERIPR_TARGET_ROOT` (`worktree-base` during Base run, `worktree-head` during Head run, `sandbox-fix` during Gate 2) so the exact same code runs against both versions.
-   - For JSON/API payloads, emit `VERIPR_PAYLOAD:{"id":"prN","payload":...}` so `vpr.py` checks recursive `schema_hash` parity automatically.
+   - For JSON/API payloads, emit one or more `VERIPR_PAYLOAD:{"id":"prN","payload":...}` lines (or `"samples":[...]`) covering empty-list and populated edge inputs so `vpr.py` merges samples before computing `schema_hash`.
 2. **Execute Parallel Worktree Differential Checks:**
    - Run `python "<VPR>" ab-verify --s "$S" --id prN --category <CAT> -- <cmd>` (chain multiple `PR-N` IDs in one turn).
    - Inspect compact verdicts:

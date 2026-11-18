@@ -434,6 +434,184 @@ class TestVeriPRCli(unittest.TestCase):
             self.assertNotIn("worktree-base", wt_list)
             self.assertNotIn("worktree-head", wt_list)
 
+    def test_feature_branch_multi_commit_merge_base(self):
+        with tempfile.TemporaryDirectory(prefix="vpr_t9_") as td:
+            root = Path(td)
+            (root / "svc.py").write_text("def fee():\n    return 2.5\n", encoding="utf-8")
+            (root / "bill.py").write_text("from svc import fee\ndef total(x):\n    return x + fee()\n", encoding="utf-8")
+            _init_git_repo(root)
+            _git(root, "checkout", "-B", "main")
+            _git(root, "add", ".")
+            _git(root, "commit", "-m", "main: base")
+
+            # Feature branch with 3 commits; commit 1 introduces the ripple defect, commits 2-3 touch unrelated files
+            _git(root, "checkout", "-b", "feat/multi-commit")
+            (root / "svc.py").write_text("def fee():\n    return None\n", encoding="utf-8")
+            _git(root, "add", "svc.py")
+            _git(root, "commit", "-m", "feat: commit 1 breaks fee")
+
+            (root / "notes.txt").write_text("step 2\n", encoding="utf-8")
+            _git(root, "add", "notes.txt")
+            _git(root, "commit", "-m", "feat: commit 2 docs")
+
+            (root / "extra.py").write_text("def noop():\n    return 0\n", encoding="utf-8")
+            _git(root, "add", "extra.py")
+            _git(root, "commit", "-m", "feat: commit 3 helper")
+
+            meta = json.loads(_run_vpr(root, "init", "--root", str(root)).stdout.strip())
+            self.assertEqual(meta["base_ref"], "main")
+            self.assertEqual(meta["head_ref"], "HEAD")
+
+            ds_out = _run_vpr(root, "diff-scope", "--root", str(root), "--s", meta["S"]).stdout
+            self.assertIn("fee", ds_out)
+            self.assertIn("RETURN_SHAPE_CHANGED", ds_out)
+
+            s_dir = root / meta["S"]
+            (s_dir / "tests" / "test_mb.py").write_text(
+                "import os, sys, unittest\nsys.path.insert(0, os.environ['VERIPR_TARGET_ROOT'])\n"
+                "from bill import total\nclass T(unittest.TestCase):\n    def test_t(self): self.assertEqual(total(10), 12.5)\n"
+                "if __name__ == '__main__': unittest.main()\n",
+                encoding="utf-8",
+            )
+            ab_out = _run_vpr(
+                root, "ab-verify", "--s", meta["S"], "--id", "mb1", "--category", "RIPPLE",
+                "--", "python", f"{meta['S']}/tests/test_mb.py",
+            ).stdout
+            self.assertIn("verdict=GATE1_RIPPLE_CONFIRMED", ab_out)
+            _run_vpr(root, "sandbox", "--s", meta["S"], "--mode", "clean")
+
+    def test_untracked_new_module_included_in_head_worktree(self):
+        with tempfile.TemporaryDirectory(prefix="vpr_t10_") as td:
+            root = Path(td)
+            (root / ".gitignore").write_text("ignored_build/\n", encoding="utf-8")
+            (root / "app.py").write_text("def compute(x):\n    return x * 2\n", encoding="utf-8")
+            _init_git_repo(root)
+            _git(root, "add", ".")
+            _git(root, "commit", "-m", "base")
+
+            # Create an untracked helper module (not git-added!) and gitignored folder, plus edit app.py to import helper
+            (root / "helpers").mkdir()
+            (root / "helpers" / "__init__.py").write_text("", encoding="utf-8")
+            (root / "helpers" / "math_utils.py").write_text("def boost(x):\n    return None\n", encoding="utf-8")
+            (root / "ignored_build").mkdir()
+            (root / "ignored_build" / "artifact.txt").write_text("ignore me\n", encoding="utf-8")
+            (root / "app.py").write_text(
+                "from helpers.math_utils import boost\ndef compute(x):\n    return boost(x)\n",
+                encoding="utf-8",
+            )
+
+            # Even if user explicitly passes --head HEAD while having untracked helper modules, worktree-head includes them
+            meta = json.loads(_run_vpr(root, "init", "--root", str(root)).stdout.strip())
+            self.assertEqual(meta["head_ref"], "WORKTREE")
+            s_dir = root / meta["S"]
+            ds_out = _run_vpr(root, "diff-scope", "--root", str(root), "--s", meta["S"]).stdout
+            self.assertIn("boost", ds_out)
+
+            (s_dir / "tests" / "test_ut.py").write_text(
+                "import os, sys, unittest\nsys.path.insert(0, os.environ['VERIPR_TARGET_ROOT'])\n"
+                "from app import compute\nclass T(unittest.TestCase):\n    def test_c(self): self.assertEqual(compute(3), 6)\n"
+                "if __name__ == '__main__': unittest.main()\n",
+                encoding="utf-8",
+            )
+            ab_out = _run_vpr(
+                root, "ab-verify", "--s", meta["S"], "--id", "ut1", "--category", "RIPPLE",
+                "--", "python", f"{meta['S']}/tests/test_ut.py",
+            ).stdout
+            # Must NOT fail with ModuleNotFoundError (HARNESS_BROKEN); must run helper and catch GATE1_RIPPLE_CONFIRMED
+            self.assertIn("verdict=GATE1_RIPPLE_CONFIRMED", ab_out)
+            self.assertFalse((s_dir / "tmp" / "worktree-head" / "ignored_build" / "artifact.txt").exists())
+
+            _run_vpr(root, "sandbox", "--s", meta["S"], "--mode", "fix")
+            self.assertTrue((s_dir / "sandbox-fix" / "helpers" / "math_utils.py").is_file())
+            self.assertFalse((s_dir / "sandbox-fix" / "ignored_build" / "artifact.txt").exists())
+            _run_vpr(root, "sandbox", "--s", meta["S"], "--mode", "clean")
+
+    def test_multi_sample_schema_merging_empty_and_populated_list(self):
+        with tempfile.TemporaryDirectory(prefix="vpr_t11_") as td:
+            root = Path(td)
+            (root / "orders_api.py").write_text(
+                "def list_orders(empty=False):\n"
+                "    if empty:\n"
+                "        return {'customer': None, 'items': []}\n"
+                "    return {'customer': 'Alice', 'items': [{'sku': 'A1', 'price_cents': 1200}]}\n",
+                encoding="utf-8",
+            )
+            _init_git_repo(root)
+            _git(root, "add", ".")
+            _git(root, "commit", "-m", "base")
+
+            # Head renames price_cents -> cost_cents inside nested list items
+            (root / "orders_api.py").write_text(
+                "def list_orders(empty=False):\n"
+                "    if empty:\n"
+                "        return {'customer': None, 'items': []}\n"
+                "    return {'customer': 'Alice', 'items': [{'sku': 'A1', 'cost_cents': 1200}]}\n",
+                encoding="utf-8",
+            )
+
+            meta = json.loads(_run_vpr(root, "init", "--root", str(root)).stdout.strip())
+            s_dir = root / meta["S"]
+            (s_dir / "tests" / "probe_multi.py").write_text(
+                "import json, os, sys\nsys.path.insert(0, os.environ['VERIPR_TARGET_ROOT'])\n"
+                "from orders_api import list_orders\n"
+                "print('VERIPR_PAYLOAD:' + json.dumps({'endpoint': 'orders', 'payload': list_orders(empty=True)}))\n"
+                "print('VERIPR_PAYLOAD:' + json.dumps({'endpoint': 'orders', 'payload': list_orders(empty=False)}))\n",
+                encoding="utf-8",
+            )
+            ab_out = _run_vpr(
+                root, "ab-verify", "--s", meta["S"], "--id", "ms1", "--category", "CONTRACT",
+                "--", "python", f"{meta['S']}/tests/probe_multi.py",
+            ).stdout
+            self.assertIn("verdict=GATE1_CONTRACT_DRIFT", ab_out)
+            self.assertIn("$.orders.items[].price_cents", ab_out)
+
+            # Verify direct merge_schema_signatures handles null + concrete type and empty + populated list
+            s_empty = vpr.compute_schema_signature({"customer": None, "items": []})
+            s_full = vpr.compute_schema_signature({"customer": "Bob", "items": [{"sku": "X", "price": 50}]})
+            merged = vpr.merge_schema_signatures(s_empty, s_full)
+            self.assertEqual(merged["customer"], "string")
+            self.assertEqual(merged["items"][0], "array")
+            self.assertEqual(merged["items"][1][0]["price"], "number")
+            _run_vpr(root, "sandbox", "--s", meta["S"], "--mode", "clean")
+
+    def test_patch_lf_line_endings_and_whitespace_tolerance(self):
+        with tempfile.TemporaryDirectory(prefix="vpr_t12_") as td:
+            root = Path(td)
+            # Write Base file with Windows CRLF line endings
+            (root / "crlf_api.py").write_bytes(b"def get_data():\r\n    return {'total': 10}\r\n")
+            _init_git_repo(root)
+            _git(root, "add", ".")
+            _git(root, "commit", "-m", "base")
+
+            (root / "crlf_api.py").write_bytes(b"def get_data():\r\n    return {'amount': 10}\r\n")
+            meta = json.loads(_run_vpr(root, "init", "--root", str(root)).stdout.strip())
+            s_dir = root / meta["S"]
+            (s_dir / "tests" / "probe_lf.py").write_text(
+                "import json, os, sys\nsys.path.insert(0, os.environ['VERIPR_TARGET_ROOT'])\n"
+                "from crlf_api import get_data\n"
+                "print('VERIPR_PAYLOAD:' + json.dumps({'id': 'lf1', 'payload': get_data()}))\n",
+                encoding="utf-8",
+            )
+            _run_vpr(root, "ab-verify", "--s", meta["S"], "--id", "lf1", "--category", "CONTRACT",
+                     "--", "python", f"{meta['S']}/tests/probe_lf.py")
+            _run_vpr(root, "sandbox", "--s", meta["S"], "--mode", "fix")
+            _run_vpr(root, "sandbox", "--s", meta["S"], "--mode", "save", "--id", "lf1")
+
+            (s_dir / "sandbox-fix" / "crlf_api.py").write_bytes(b"def get_data():\r\n    return {'total': 10}\r\n")
+            vf_out = _run_vpr(root, "verify-fix", "--s", meta["S"], "--id", "lf1", "--auto-rollback").stdout
+            self.assertIn("CONFIRMED_ZERO_RIPPLE_FIX", vf_out)
+            self.assertIn("git_apply=OK", vf_out)
+
+            # Assert pure LF (\n) bytes on disk (zero \r!)
+            for pfile in (s_dir / "patches" / "lf1.patch", s_dir / "patches" / "veripr-fixes.patch"):
+                raw_bytes = pfile.read_bytes()
+                self.assertNotIn(b"\r", raw_bytes)
+                self.assertIn(b"\n", raw_bytes)
+
+            _git(root, "apply", "--ignore-space-change", "--ignore-whitespace", str(s_dir / "patches" / "veripr-fixes.patch"))
+            self.assertIn("'total': 10", (root / "crlf_api.py").read_text(encoding="utf-8"))
+            _run_vpr(root, "sandbox", "--s", meta["S"], "--mode", "clean")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
