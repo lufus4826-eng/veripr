@@ -1,0 +1,39 @@
+name: VeriPR CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+jobs:
+  verify:
+    name: Test & Demo (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Configure Git author for temporary demo repos
+        run: |
+          git config --global user.name "VeriPR CI"
+          git config --global user.email "ci@verihunt.local"
+
+      - name: Verify CLI help
+        run: python -B scripts/vpr.py --help
+
+      - name: Run unit & integration suite
+        run: python -B tests/test_vpr_cli.py
+
+      - name: Run 1-command checkout_pr_demo showcase
+        run: python -B examples/checkout_pr_demo/run_demo.py
